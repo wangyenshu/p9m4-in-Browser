@@ -41,18 +41,49 @@
 "use strict";
 
 async function createStateBlobUrl(baseName) {
-    const parts = [];
-    let index = 1;
-    while (true) {
-        const url = `${baseName}.part${index}`;
-        try {
-            const resp = await fetch(url);
-            if (!resp.ok) break;
-            parts.push(await resp.arrayBuffer());
-            index++;
-        } catch (e) { break; }
+    const concurrency = 6;
+    let currentIndex = 1;
+    let maxIndex = Infinity; 
+    const buffers = [];
+
+    async function fetchWorker() {
+        while (true) {
+            const index = currentIndex++;
+
+            if (index > maxIndex) break;
+
+            const url = `${baseName}.part${index}`;
+            try {
+                const resp = await fetch(url);
+                if (!resp.ok) {
+                    maxIndex = Math.min(maxIndex, index - 1);
+                    break;
+                }
+                buffers[index - 1] = await resp.arrayBuffer();
+            } catch (e) {
+                maxIndex = Math.min(maxIndex, index - 1);
+                break;
+            }
+        }
     }
-    const blob = new Blob(parts, { type: "application/octet-stream" });
+
+    const workers = [];
+    for (let i = 0; i < concurrency; i++) {
+        workers.push(fetchWorker());
+    }
+    
+    await Promise.all(workers);
+
+    const validParts = [];
+    for (let i = 0; i < buffers.length; i++) {
+        if (buffers[i]) {
+            validParts.push(buffers[i]);
+        } else {
+            break;
+        }
+    }
+
+    const blob = new Blob(validParts, { type: "application/octet-stream" });
     return URL.createObjectURL(blob);
 }
 
@@ -104,19 +135,21 @@ window.onload = async function () {
                 var reader = new FileReader();
                 reader.onload = function(file) {
                     return function(e) {
-                        var data = (new TextEncoder('UTF-8')).encode(e.target.result);
+                        // Use Uint8Array to handle raw binary bytes safely
+                        var data = new Uint8Array(e.target.result);
                         emulator.create_file(path + file.name, data);
                         console.log("uploaded " + file.name + " to " + path + file.name);
                     }
                 }(files[i]);
-                reader.readAsText(files[i]);
+                // Read as ArrayBuffer
+                reader.readAsArrayBuffer(files[i]);
             }
             this.blur();
             screen.focus();
         };
         
         document.getElementById("btn_download_file").onclick = async function() {
-            const path = document.getElementById("download_path").value;
+            let path = document.getElementById("download_path").value;
             if (path.slice(0, 1) !== "/") path = "/" + path;
             try {
                 const data = await emulator.read_file(path);
@@ -145,10 +178,10 @@ window.onload = async function () {
         document.getElementById("btn_import_repo").onclick = async function() {
             const urlInput = document.getElementById("repo_url").value;
             const branch = document.getElementById("repo_branch").value;
-            const targetPath = document.getElementById("repo_import_path").value;
+            let targetPath = document.getElementById("repo_import_path").value;
             const statusLabel = document.getElementById("import_status");
 
-            if (targetPath.slice(0, 1) !== "/") path = "/" + path;
+            if (targetPath.slice(0, 1) !== "/") targetPath = "/" + targetPath;
             if (targetPath.slice(-1) !== "/") targetPath += "/";
 
             const match = urlInput.match(/github\.com\/([^\/]+)\/([^\/]+)/);
