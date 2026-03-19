@@ -7,22 +7,42 @@
 </head>
 
 <body>
-<div id="screen_container">
+<div id="screen_container" tabindex="0" style="outline: none;">
   <div style="white-space: pre; font: 14px monospace; line-height: 14px"></div>
-  <canvas></canvas>
+  <canvas style="display: none"></canvas>
+</div>
+
+<div style="margin-top: 10px;">
+  <label for="upload_path">Upload to Absolute Path: </label>
+  <input type="text" id="upload_path" value="/root/" style="width: 150px;">
+  <input type="file" id="upload_files" multiple>
+
+  <br><br>
+
+  <label>GitHub Repo URL: </label>
+  <input type="text" id="repo_url" placeholder="https://github.com/user/repo" style="width: 200px;">
+  
+  <label>Branch: </label>
+  <input type="text" id="repo_branch" value="master" style="width: 80px;">
+
+  <label>Import into Absolute Path: </label>
+  <input type="text" id="repo_import_path" value="/root/" style="width: 100px;">
+
+  <button id="btn_import_repo">Import Repo</button>
+  <span id="import_status" style="margin-left: 10px; font-size: 0.9em;"></span>
+  
+  <br><br>
+  <label>Download File Absolute Path: </label>
+  <input type="text" id="download_path" value="/root/example.txt" style="width: 200px;">
+  <button id="btn_download_file">Download File</button>
 </div>
 
 <script>
 "use strict";
 
-/**
- * Load debian-state-base.bin.part1, part2, ...
- * Merge into a single Blob and return a Blob URL
- */
 async function createStateBlobUrl(baseName) {
     const parts = [];
     let index = 1;
-
     while (true) {
         const url = `${baseName}.part${index}`;
         try {
@@ -30,11 +50,8 @@ async function createStateBlobUrl(baseName) {
             if (!resp.ok) break;
             parts.push(await resp.arrayBuffer());
             index++;
-        } catch (e) {
-            break;
-        }
+        } catch (e) { break; }
     }
-
     const blob = new Blob(parts, { type: "application/octet-stream" });
     return URL.createObjectURL(blob);
 }
@@ -42,38 +59,171 @@ async function createStateBlobUrl(baseName) {
 window.onload = async function () {
     try {
         const screen = document.getElementById("screen_container");
+        screen.addEventListener("mousedown", function() {
+            screen.focus();
+        });
 
-        // Merge the split state file
-        const stateUrl = await createStateBlobUrl(
-            "images/debian-state-base.bin"
-        );
+        const stateUrl = await createStateBlobUrl("images/debian-state-base.bin");
 
-        // Start v86
         const emulator = new V86({
             wasm_path: "build/v86.wasm",
-            memory_size: 512 * 1024 * 1024,
+            memory_size: 1536 * 1024 * 1024,
             vga_memory_size: 8 * 1024 * 1024,
             screen_container: screen,
-
-            // IMPORTANT: use merged Blob URL here
             initial_state: { url: stateUrl },
-
-            filesystem: {
-                baseurl: "images/debian-9p-rootfs-flat/"
-            },
-
+            filesystem: { baseurl: "images/debian-9p-rootfs-flat/" },
             autostart: true,
         });
 
-        // MODIFICATION: Add pointer lock listener to fix mouse tracking
-        const canvas = document.querySelector("canvas");
-        canvas.addEventListener("click", function() {
-            canvas.requestPointerLock();
-        });
+        function runCommandWithSentinel(cmd) {
+            return new Promise((resolve) => {
+                const sentinel = "V86_CMD_DONE";
+                let buffer = "";
+                
+                const listener = (byte) => {
+                    const char = String.fromCharCode(byte);
+                    buffer += char;
+                    if (buffer.includes(sentinel)) {
+                        emulator.remove_listener("serial0-output-byte", listener);
+                        resolve();
+                    }
+                };
+
+                emulator.add_listener("serial0-output-byte", listener);
+                emulator.serial0_send(`${cmd}; echo "${sentinel}"\n`);
+            });
+        }
+
+        document.getElementById("upload_files").onchange = function(e) {
+            var files = e.target.files;
+            var path = document.getElementById("upload_path").value;
+            if (path.slice(0, 1) !== "/") path = "/" + path;
+            if (path.slice(-1) !== "/") path += "/";
+
+            for(var i=0; i<files.length; i++) {
+                var reader = new FileReader();
+                reader.onload = function(file) {
+                    return function(e) {
+                        var data = (new TextEncoder('UTF-8')).encode(e.target.result);
+                        emulator.create_file(path + file.name, data);
+                        console.log("uploaded " + file.name + " to " + path + file.name);
+                    }
+                }(files[i]);
+                reader.readAsText(files[i]);
+            }
+            this.blur();
+            screen.focus();
+        };
+        
+        document.getElementById("btn_download_file").onclick = async function() {
+            const path = document.getElementById("download_path").value;
+            if (path.slice(0, 1) !== "/") path = "/" + path;
+            try {
+                const data = await emulator.read_file(path);
+                if (data) {
+                    const blob = new Blob([data], { type: "application/octet-stream" });
+                    const url = window.URL.createObjectURL(blob);
+                    const a = document.createElement("a");
+                    a.href = url;
+                    a.download = path.split('/').pop();
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    window.URL.revokeObjectURL(url);
+                } else {
+                    alert("File not found: " + path);
+                }
+            } catch (e) {
+                console.error(e);
+                alert("Error reading file (File might not exist).");
+            }
+            this.blur();
+            screen.focus();
+        };
+
+        // Github Repo Import
+        document.getElementById("btn_import_repo").onclick = async function() {
+            const urlInput = document.getElementById("repo_url").value;
+            const branch = document.getElementById("repo_branch").value;
+            const targetPath = document.getElementById("repo_import_path").value;
+            const statusLabel = document.getElementById("import_status");
+
+            if (targetPath.slice(0, 1) !== "/") path = "/" + path;
+            if (targetPath.slice(-1) !== "/") targetPath += "/";
+
+            const match = urlInput.match(/github\.com\/([^\/]+)\/([^\/]+)/);
+            if(!match) { alert("Invalid GitHub URL."); return; }
+            const [ , owner, repo] = match;
+
+            try {
+                this.disabled = true;
+                statusLabel.innerText = "Fetching file list...";
+                
+                // Fetch Recursive Tree
+                const treeUrl = `https://api.github.com/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`;
+                const treeResp = await fetch(treeUrl);
+                if (!treeResp.ok) throw new Error("Branch not found or API limit hit");
+                const treeData = await treeResp.json();
+
+                // Identify Directories and Files
+                const uniqueDirs = new Set();
+                const filesToDownload = [];
+
+                treeData.tree.forEach(item => {
+                    if (item.type === "blob") {
+                        const fullPath = targetPath + item.path;
+                        filesToDownload.push({ 
+                            path: item.path, // relative path for fetching
+                            fullPath: fullPath 
+                        });
+
+                        // Extract directory from path
+                        const parts = item.path.split('/');
+                        if (parts.length > 1) {
+                            parts.pop(); // remove filename
+                            // Add full path to directory set
+                            uniqueDirs.add(targetPath + parts.join('/'));
+                        }
+                    }
+                });
+
+                // Create Directories
+                if (uniqueDirs.size > 0) {
+                    statusLabel.innerText = `Creating ${uniqueDirs.size} folders...`;
+                    const dirList = Array.from(uniqueDirs).map(d => `"${d}"`).join(' ');
+                    await runCommandWithSentinel(`mkdir -p ${dirList}`);
+                }
+
+                // Download and Write Files
+                let count = 0;
+                statusLabel.innerText = `Downloading ${filesToDownload.length} files...`;
+
+                for (const file of filesToDownload) {
+                    const rawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${file.path}`;
+                    const fileResp = await fetch(rawUrl);
+                    if (fileResp.ok) {
+                        const content = await fileResp.arrayBuffer();
+                        emulator.create_file(file.fullPath, new Uint8Array(content));
+                        count++;
+                        statusLabel.innerText = `Importing: ${count}/${filesToDownload.length}`;
+                    }
+                }
+
+                statusLabel.innerText = `Done! Imported ${count} files.`;
+
+            } catch (err) {
+                console.error(err);
+                statusLabel.innerText = "Error: " + err.message;
+            } finally {
+                this.disabled = false;
+                this.blur();
+                screen.focus();
+            }
+        };
 
     } catch (e) {
         console.error(e);
-        alert("Failed to load Debian state: " + e.message);
+        alert("Failed to load: " + e.message);
     }
 };
 </script>
