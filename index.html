@@ -125,6 +125,11 @@ window.onload = async function () {
             });
         }
 
+        const canvas = document.querySelector("canvas");
+        canvas.addEventListener("click", function() {
+            canvas.requestPointerLock();
+        });
+
         document.getElementById("upload_files").onchange = function(e) {
             var files = e.target.files;
             var path = document.getElementById("upload_path").value;
